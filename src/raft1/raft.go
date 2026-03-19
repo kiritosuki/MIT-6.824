@@ -276,13 +276,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (3B).
-	rf.mu.Lock()
-	if rf.stat != Leader {
-		isLeader = false
-		rf.mu.Unlock()
-		return index, term, isLeader
-	}
-
 	return index, term, isLeader
 }
 
