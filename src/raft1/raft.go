@@ -271,14 +271,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// 刷新计时器
 	rf.lastHeart = time.Now()
-	// 如果日志为空 当作心跳处理
-	if args.Entries == nil || len(args.Entries) == 0 {
-		reply.Term = rf.currentTerm
-		reply.Success = true
-		// 更新commitIndex TODO AI修正方案 心跳也要更新 commitIndex
-		rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
-		return
-	}
+
 	// 判断日志匹配 要求rf.log[args.PrevLogIndex].term == args.PrevLogTerm
 	if len(rf.log) <= args.PrevLogIndex {
 		// 节点log不够长 需要leader的PrevLogIndex前移
@@ -289,7 +282,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 如果节点log足够长
 	if rf.log[args.PrevLogIndex].Term == args.PrevLogTerm {
 		// 表示遇到了匹配的entry
-		rf.log = append(rf.log[:(args.PrevLogIndex+1)], args.Entries...)
+		if args.Entries != nil && len(args.Entries) != 0 {
+			rf.log = append(rf.log[:(args.PrevLogIndex+1)], args.Entries...)
+		}
 		reply.Term = rf.currentTerm
 		reply.Success = true
 		// 更新commitIndex
