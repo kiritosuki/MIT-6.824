@@ -245,8 +245,11 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term          int
+	Success       bool
+	LogLen        int // backup 记录follower的log的真实长度
+	ConflictTerm  int // 冲突处follower entry的term
+	ConflictIndex int // ConflictTerm处的第一个entry
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -277,6 +280,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// 节点log不够长 需要leader的PrevLogIndex前移
 		reply.Term = rf.currentTerm
 		reply.Success = false
+		// 记录follower log的长度 方便快速回退
+		reply.LogLen = len(rf.log)
+		reply.ConflictTerm = -1 // -1表示长度错误
 		return
 	}
 	// 如果节点log足够长
@@ -287,12 +293,23 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 		reply.Term = rf.currentTerm
 		reply.Success = true
+		reply.LogLen = len(rf.log)
 		// 更新commitIndex
 		rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
 	} else {
 		// 表示该项entry不匹配 需要leader的PrevLogIndex前移来寻找匹配项
 		reply.Term = rf.currentTerm
 		reply.Success = false
+		// 快速回退
+		// 记录冲突的term
+		reply.ConflictTerm = rf.log[args.PrevLogIndex].Term
+		// 寻找冲突term下第一个entry的索引
+		conflictIndex := args.PrevLogIndex
+		for conflictIndex >= 0 && rf.log[conflictIndex].Term == rf.log[args.PrevLogIndex].Term {
+			conflictIndex--
+		}
+		// 循环出来之后 conflictIndex就是log中前一个term的entry索引了 需要加一才是该term下的第一个entry
+		reply.ConflictIndex = conflictIndex + 1
 	}
 }
 
@@ -485,7 +502,33 @@ func (rf *Raft) doHeartBeat(server int) {
 	// 如果leader的term正常 下面判断reply
 	if !reply.Success {
 		// 若返回false
-		rf.nextIndex[server]--
+		// 快速回退处理
+		if reply.ConflictTerm == -1 {
+			// 如果是因为follower log长度太短
+			rf.nextIndex[server] = reply.LogLen
+		} else {
+			// 由于PrevLogIndex处对应entry的term不一致 分两种情况
+			// A: leader中不含有conflictTerm
+			// B: leader中含有conflictTerm
+			lastIndexOfTerm := -1
+			for i := args.PrevLogIndex; i >= 0; i-- {
+				if rf.log[i].Term == reply.ConflictTerm {
+					lastIndexOfTerm = i
+					break
+				}
+			}
+			if lastIndexOfTerm == -1 {
+				// case A
+				// leader   0 4 6 6 6 7 7 7
+				// follower 0 4 5 5 5 8 8 8
+				rf.nextIndex[server] = reply.ConflictIndex
+			} else {
+				// case B
+				// leader   0 4 4 4 6 6 6
+				// follower 0 4 4 4 4 4 4
+				rf.nextIndex[server] = lastIndexOfTerm + 1
+			}
+		}
 	} else if entries != nil && len(entries) != 0 {
 		// 若返回true 并且不是心跳 说明日志更新成功
 		rf.matchIndex[server] = args.PrevLogIndex + len(entries)
