@@ -8,11 +8,15 @@ package raft
 // raft interface.
 
 import (
+	"bytes"
+	"fmt"
+
 	//	"bytes"
 	"math/rand"
 	"sync"
 	"time"
 
+	"6.5840/labgob"
 	//	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raftapi"
@@ -80,6 +84,7 @@ func (rf *Raft) GetState() (int, bool) {
 // second argument to persister.Save().
 // after you've implemented snapshots, pass the current snapshot
 // (or nil if there's not yet a snapshot).
+// 该方法不加锁 保证调用时已经持有锁
 func (rf *Raft) persist() {
 	// Your code here (3C).
 	// Example:
@@ -89,9 +94,18 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
+	w := new(bytes.Buffer)
+	encoder := labgob.NewEncoder(w)
+	encoder.Encode(rf.log)
+	encoder.Encode(rf.currentTerm)
+	encoder.Encode(rf.voteFor)
+	raftState := w.Bytes()
+	// TODO 3C暂时snapshot为nil
+	rf.persister.Save(raftState, nil)
 }
 
 // restore previously persisted state.
+// 该方法不加锁 保证调用时已经持有锁
 func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
@@ -109,6 +123,19 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	r := bytes.NewBuffer(data)
+	decoder := labgob.NewDecoder(r)
+	var log []LogEntry
+	var currentTerm int
+	var voteFor int
+	if decoder.Decode(&log) != nil || decoder.Decode(&currentTerm) != nil || decoder.Decode(&voteFor) != nil {
+		fmt.Println("decode error")
+	} else {
+		rf.log = log
+		rf.currentTerm = currentTerm
+		rf.voteFor = voteFor
+	}
+
 }
 
 // how many bytes in Raft's persisted log?
@@ -155,6 +182,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term < rf.currentTerm {
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
+		// 持久化状态
+		rf.persist()
 		return
 	}
 	//  all servers 降级机制
@@ -162,6 +191,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.currentTerm = args.Term
 		rf.stat = Follower
 		rf.voteFor = -1
+		// 持久化状态
+		rf.persist()
 	}
 	// 如果candidate的term与当前节点一样新或者更新
 	// 每个节点只能投票一次(如果voteFor是该candidate 需要保持RPC重发的幂等性)
@@ -169,6 +200,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		// 说明投给了其他节点
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
+		// 持久化状态
+		rf.persist()
 		return
 	}
 	// 如果没投过票 或者在之前的丢失RPC中投给了该candidate
@@ -179,18 +212,24 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		// 如果candidate log term落后 拒绝投票
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
+		// 持久化状态
+		rf.persist()
 	} else if logTerm == args.LastLogTerm {
 		// 如果一样新 需要比较index
 		if logIndex > args.LastLogIndex {
 			// 如果candidate log index落后 拒绝投票
 			reply.VoteGranted = false
 			reply.Term = rf.currentTerm
+			// 持久化状态
+			rf.persist()
 		} else {
 			// 如果candidate log index至少与节点一样新或者更新 允许投票
 			reply.VoteGranted = true
 			rf.voteFor = args.CandidateId
 			reply.Term = rf.currentTerm
 			rf.lastHeart = time.Now()
+			// 持久化状态
+			rf.persist()
 		}
 	} else {
 		// 如果candidate log term更新 允许投票
@@ -198,6 +237,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.voteFor = args.CandidateId
 		reply.Term = rf.currentTerm
 		rf.lastHeart = time.Now()
+		// 持久化状态
+		rf.persist()
 	}
 }
 
@@ -259,12 +300,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.Success = false
+		// 持久化状态
+		rf.persist()
 		return
 	}
 	// all servers 降级机制
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.voteFor = -1
+		// 持久化状态
+		rf.persist()
 	}
 	// 处理心跳时 term相同时也要触发降级 所以stat更新拿出来写了 是args.Term >= rf.currentTerm的情况
 	// 包含=的情况 是因为leader需要通知同期的candidate降级
@@ -290,6 +335,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// 表示遇到了匹配的entry
 		if args.Entries != nil && len(args.Entries) != 0 {
 			rf.log = append(rf.log[:(args.PrevLogIndex+1)], args.Entries...)
+			// 持久化状态
+			rf.persist()
 		}
 		reply.Term = rf.currentTerm
 		reply.Success = true
@@ -346,6 +393,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Command: command,
 		Term:    rf.currentTerm,
 	})
+	// 持久化状态
+	rf.persist()
 	index = len(rf.log) - 1
 	term = rf.currentTerm
 	return index, term, isLeader
@@ -383,6 +432,8 @@ func (rf *Raft) launchElection() {
 	rf.currentTerm++
 	rf.votesGot = 1 // 给自己投一票
 	rf.voteFor = rf.me
+	// 持久化状态
+	rf.persist()
 	rf.mu.Unlock()
 	for i := range rf.peers {
 		if i == rf.me {
@@ -419,6 +470,8 @@ func (rf *Raft) doElection(server int) {
 		// 加CAS判断
 		if rf.votesGot > len(rf.peers)/2 && rf.stat == Candidate {
 			rf.stat = Leader
+			// 持久化状态
+			rf.persist()
 			// 更新leader的一些易变字段
 			for i := 0; i < len(rf.peers); i++ {
 				rf.nextIndex[i] = len(rf.log)
@@ -440,6 +493,8 @@ func (rf *Raft) doElection(server int) {
 			rf.currentTerm = reply.Term
 			rf.stat = Follower
 			rf.voteFor = -1
+			// 持久化状态
+			rf.persist()
 		}
 		rf.mu.Unlock()
 	}
@@ -467,6 +522,11 @@ func (rf *Raft) heartBeat() {
 // leader心跳机制的实现
 func (rf *Raft) doHeartBeat(server int) {
 	rf.mu.Lock()
+	// figure8 (c)中S1.nextIndex = 4 但是在(d)中被覆盖
+	// 如果之后S1重新成为leader 发送心跳前需要更新S1.nextIndex = 3 否则会越界
+	if rf.nextIndex[server] > len(rf.log) {
+		rf.nextIndex[server] = len(rf.log)
+	}
 	var entries []LogEntry
 	entries = rf.log[rf.nextIndex[server]:]
 	args := AppendEntriesArgs{
@@ -497,6 +557,8 @@ func (rf *Raft) doHeartBeat(server int) {
 		rf.currentTerm = reply.Term
 		rf.voteFor = -1
 		rf.lastHeart = time.Now()
+		// 持久化状态
+		rf.persist()
 		return
 	}
 	// 如果leader的term正常 下面判断reply
@@ -602,6 +664,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		Command: nil,
 		Term:    0,
 	}
+	rf.readPersist(rf.persister.ReadRaftState())
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 	rf.nextIndex = make([]int, len(rf.peers))
