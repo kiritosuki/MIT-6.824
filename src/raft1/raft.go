@@ -11,13 +11,13 @@ import (
 	"bytes"
 	"fmt"
 
-	//	"bytes"
+	// "bytes"
 	"math/rand"
 	"sync"
 	"time"
 
 	"6.5840/labgob"
-	//	"6.5840/labgob"
+	// "6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raftapi"
 	"6.5840/tester1"
@@ -28,7 +28,6 @@ const (
 	Candidate          = 2
 	Leader             = 3
 	HeartBeatGap       = 150
-	ApplyGap           = 20
 	ElectionTimeoutMin = 600
 	ElectionTimeoutMax = 800
 )
@@ -60,6 +59,8 @@ type Raft struct {
 	snapshot          []byte
 	lastIncludedIndex int
 	lastIncludedTerm  int
+	// 同于通知applyLog
+	applyCond chan struct{}
 }
 
 type LogEntry struct {
@@ -85,6 +86,13 @@ func (rf *Raft) getLastLogTerm() int {
 // 获取log的逻辑长度
 func (rf *Raft) getLogLen() int {
 	return len(rf.log) + rf.lastIncludedIndex
+}
+
+func (rf *Raft) sigApply() {
+	select {
+	case rf.applyCond <- struct{}{}:
+	default:
+	}
 }
 
 // return currentTerm and whether this server
@@ -392,6 +400,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.LogLen = rf.getLogLen()
 		// 更新commitIndex
 		rf.commitIndex = min(args.LeaderCommit, rf.getLastLogIndex())
+		rf.sigApply()
 	} else {
 		// 表示该项entry不匹配 需要leader的PrevLogIndex前移来寻找匹配项
 		reply.Term = rf.currentTerm
@@ -466,6 +475,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.lastIncludedIndex = args.LastIncludedIndex
 	rf.lastIncludedTerm = args.LastIncludedTerm
 	rf.commitIndex = rf.lastIncludedIndex
+	rf.sigApply()
 	// 持久化状态
 	rf.persist()
 	reply.Term = rf.currentTerm
@@ -690,6 +700,7 @@ func (rf *Raft) doHeartBeat(server int) {
 			}
 			if count > len(rf.peers)/2 && rf.log[rf.toRealIndex(n)].Term == rf.currentTerm {
 				rf.commitIndex = n
+				rf.sigApply()
 				break
 			}
 		}
@@ -775,6 +786,7 @@ func (rf *Raft) doHeartBeat(server int) {
 			}
 			if count > len(rf.peers)/2 && rf.log[rf.toRealIndex(n)].Term == rf.currentTerm {
 				rf.commitIndex = n
+				rf.sigApply()
 				break
 			}
 		}
@@ -785,6 +797,14 @@ func (rf *Raft) doHeartBeat(server int) {
 func (rf *Raft) applyLog(applyCh chan raftapi.ApplyMsg) {
 	for {
 		rf.mu.Lock()
+
+		// 核心逻辑：如果目前没有需要应用的内容（包括日志和快照）
+		for rf.lastApplied >= rf.commitIndex && rf.lastApplied >= rf.lastIncludedIndex {
+			rf.mu.Unlock() // 阻塞前必须释放锁，否则其他协程无法更新 commitIndex
+			<-rf.applyCond // 阻塞在这里，直到有人往管道发信号
+			rf.mu.Lock()   // 醒来后重新加锁，检查条件
+		}
+
 		// 如果snapshot还没有应用 先应用它
 		if rf.lastApplied < rf.lastIncludedIndex {
 			msg := raftapi.ApplyMsg{
@@ -798,22 +818,22 @@ func (rf *Raft) applyLog(applyCh chan raftapi.ApplyMsg) {
 			applyCh <- msg
 			continue
 		}
-		// 如果没有可以应用的日志
-		if rf.lastApplied >= rf.commitIndex {
-			rf.mu.Unlock()
-			time.Sleep(ApplyGap * time.Millisecond)
-			continue
-		}
 		// 应用日志
-		rf.lastApplied++
-		entry := rf.log[rf.toRealIndex(rf.lastApplied)]
-		msg := raftapi.ApplyMsg{
-			CommandValid: true,
-			Command:      entry.Command,
-			CommandIndex: rf.lastApplied,
+		msgs := make([]raftapi.ApplyMsg, 0)
+		for rf.lastApplied < rf.commitIndex {
+			rf.lastApplied++
+			entry := rf.log[rf.toRealIndex(rf.lastApplied)]
+			msg := raftapi.ApplyMsg{
+				CommandValid: true,
+				Command:      entry.Command,
+				CommandIndex: rf.lastApplied,
+			}
+			msgs = append(msgs, msg)
 		}
 		rf.mu.Unlock()
-		applyCh <- msg
+		for _, applyMsg := range msgs {
+			applyCh <- applyMsg
+		}
 	}
 }
 
@@ -839,6 +859,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastHeart = time.Now()
 	rf.currentTerm = 0
 	rf.voteFor = -1
+	rf.applyCond = make(chan struct{}, 1)
 	rf.log = make([]LogEntry, 1)
 	rf.log[0] = LogEntry{
 		Command: nil,
