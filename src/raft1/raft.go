@@ -28,8 +28,8 @@ const (
 	Candidate          = 2
 	Leader             = 3
 	HeartBeatGap       = 150
-	ElectionTimeoutMin = 600
-	ElectionTimeoutMax = 800
+	ElectionTimeoutMin = 400
+	ElectionTimeoutMax = 600
 )
 
 // A Go object implementing a single Raft peer.
@@ -390,16 +390,36 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 如果节点log足够长
 	if rf.log[rf.toRealIndex(args.PrevLogIndex)].Term == args.PrevLogTerm {
 		// 表示遇到了匹配的entry
+		// TODO 乱序问题 这里其实可能不是第一个遇到的符号条件的匹配索引 往后再找
 		if args.Entries != nil && len(args.Entries) != 0 {
-			rf.log = append(rf.log[:rf.toRealIndex(args.PrevLogIndex+1)], args.Entries...)
-			// 持久化状态
-			rf.persist()
+			for i, entry := range args.Entries {
+				idx := args.PrevLogIndex + 1 + i
+				if idx <= rf.getLastLogIndex() {
+					if rf.log[rf.toRealIndex(idx)].Term != entry.Term {
+						rf.log = append(rf.log[:rf.toRealIndex(idx)], args.Entries[i:]...)
+						rf.persist()
+						break
+					}
+				} else {
+					rf.log = append(rf.log, args.Entries[i:]...)
+					rf.persist()
+					break
+				}
+			}
 		}
+
+		// TODO 之前的代码 上面的旧版本 先注释掉 明天看
+		//if args.Entries != nil && len(args.Entries) != 0 {
+		//	rf.log = append(rf.log[:rf.toRealIndex(args.PrevLogIndex+1)], args.Entries...)
+		//	// 持久化状态
+		//	rf.persist()
+		//}
 		reply.Term = rf.currentTerm
 		reply.Success = true
 		reply.LogLen = rf.getLogLen()
 		// 更新commitIndex
-		rf.commitIndex = min(args.LeaderCommit, rf.getLastLogIndex())
+		// TODO 可能要再想想
+		rf.commitIndex = max(rf.commitIndex, min(args.LeaderCommit, rf.getLastLogIndex()))
 		rf.sigApply()
 	} else {
 		// 表示该项entry不匹配 需要leader的PrevLogIndex前移来寻找匹配项
@@ -515,6 +535,12 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	})
 	// 持久化状态
 	rf.persist()
+	// 立刻尝试日志同步 而不是等待心跳
+	for i := range rf.peers {
+		if i != rf.me {
+			go rf.doHeartBeat(i)
+		}
+	}
 	index = rf.getLastLogIndex()
 	term = rf.currentTerm
 	return index, term, isLeader
@@ -791,6 +817,12 @@ func (rf *Raft) doHeartBeat(server int) {
 			}
 		}
 	}
+	// 这段代码加上之后能提速 但是RPC的并发量会非常爆炸
+	// 如果我还是 Leader，并且发现该节点的日志仍然落后于我的最新日志
+	//if rf.stat == Leader && rf.matchIndex[server] < rf.getLastLogIndex() {
+	//	// 立即启动下一次同步，不需要等待心跳
+	//	go rf.doHeartBeat(server)
+	//}
 }
 
 // 应用log 实际上是放入上层服务的channel中
