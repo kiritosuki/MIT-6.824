@@ -664,7 +664,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		Command: nil,
 		Term:    0,
 	}
-	rf.readPersist(rf.persister.ReadRaftState())
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 	rf.nextIndex = make([]int, len(rf.peers))
