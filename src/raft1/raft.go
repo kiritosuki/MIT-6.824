@@ -803,10 +803,10 @@ func (rf *Raft) doHeartBeat(server int) {
 	}
 	// 这段代码加上之后能提速 但是RPC的并发量会非常爆炸
 	// 如果我还是 Leader，并且发现该节点的日志仍然落后于我的最新日志
-	if rf.stat == Leader && rf.matchIndex[server] < rf.getLastLogIndex() {
-		// 立即启动下一次同步，不需要等待心跳
-		go rf.doHeartBeat(server)
-	}
+	//if rf.stat == Leader && rf.matchIndex[server] < rf.getLastLogIndex() {
+	//	// 立即启动下一次同步，不需要等待心跳
+	//	go rf.doHeartBeat(server)
+	//}
 }
 
 // 应用log 实际上是放入上层服务的channel中
