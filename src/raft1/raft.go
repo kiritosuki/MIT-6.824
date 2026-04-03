@@ -390,36 +390,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 如果节点log足够长
 	if rf.log[rf.toRealIndex(args.PrevLogIndex)].Term == args.PrevLogTerm {
 		// 表示遇到了匹配的entry
-		// TODO 乱序问题 这里其实可能不是第一个遇到的符号条件的匹配索引 往后再找
 		if args.Entries != nil && len(args.Entries) != 0 {
-			for i, entry := range args.Entries {
-				idx := args.PrevLogIndex + 1 + i
-				if idx <= rf.getLastLogIndex() {
-					if rf.log[rf.toRealIndex(idx)].Term != entry.Term {
-						rf.log = append(rf.log[:rf.toRealIndex(idx)], args.Entries[i:]...)
-						rf.persist()
-						break
-					}
-				} else {
-					rf.log = append(rf.log, args.Entries[i:]...)
-					rf.persist()
-					break
-				}
-			}
+			rf.log = append(rf.log[:rf.toRealIndex(args.PrevLogIndex+1)], args.Entries...)
+			// 持久化状态
+			rf.persist()
 		}
-
-		// TODO 之前的代码 上面的旧版本 先注释掉 明天看
-		//if args.Entries != nil && len(args.Entries) != 0 {
-		//	rf.log = append(rf.log[:rf.toRealIndex(args.PrevLogIndex+1)], args.Entries...)
-		//	// 持久化状态
-		//	rf.persist()
-		//}
 		reply.Term = rf.currentTerm
 		reply.Success = true
 		reply.LogLen = rf.getLogLen()
 		// 更新commitIndex
-		// TODO 可能要再想想
-		rf.commitIndex = max(rf.commitIndex, min(args.LeaderCommit, rf.getLastLogIndex()))
+		rf.commitIndex = min(args.LeaderCommit, rf.getLastLogIndex())
 		rf.sigApply()
 	} else {
 		// 表示该项entry不匹配 需要leader的PrevLogIndex前移来寻找匹配项
@@ -715,19 +695,21 @@ func (rf *Raft) doHeartBeat(server int) {
 		rf.nextIndex[server] = rf.matchIndex[server] + 1
 		// 尝试更新commitIndex
 		for n := rf.getLastLogIndex(); n > rf.commitIndex; n-- {
-			count := 1 // 自己算一个
-			for i := 0; i < len(rf.peers); i++ {
-				if i == rf.me {
-					continue
+			if rf.log[rf.toRealIndex(n)].Term == rf.currentTerm {
+				count := 1 // 自己算一个
+				for i := 0; i < len(rf.peers); i++ {
+					if i == rf.me {
+						continue
+					}
+					if rf.matchIndex[i] >= n {
+						count++
+					}
 				}
-				if rf.matchIndex[i] >= n {
-					count++
+				if count > len(rf.peers)/2 {
+					rf.commitIndex = n
+					rf.sigApply()
+					break
 				}
-			}
-			if count > len(rf.peers)/2 && rf.log[rf.toRealIndex(n)].Term == rf.currentTerm {
-				rf.commitIndex = n
-				rf.sigApply()
-				break
 			}
 		}
 		return
@@ -801,28 +783,30 @@ func (rf *Raft) doHeartBeat(server int) {
 		rf.nextIndex[server] = rf.matchIndex[server] + 1
 		// 每成功更新一个节点的日志 尝试更新commitIndex
 		for n := rf.getLastLogIndex(); n > rf.commitIndex; n-- {
-			count := 1 // 自己算一个
-			for i := 0; i < len(rf.peers); i++ {
-				if i == rf.me {
-					continue
+			if rf.log[rf.toRealIndex(n)].Term == rf.currentTerm {
+				count := 1 // 自己算一个
+				for i := 0; i < len(rf.peers); i++ {
+					if i == rf.me {
+						continue
+					}
+					if rf.matchIndex[i] >= n {
+						count++
+					}
 				}
-				if rf.matchIndex[i] >= n {
-					count++
+				if count > len(rf.peers)/2 {
+					rf.commitIndex = n
+					rf.sigApply()
+					break
 				}
-			}
-			if count > len(rf.peers)/2 && rf.log[rf.toRealIndex(n)].Term == rf.currentTerm {
-				rf.commitIndex = n
-				rf.sigApply()
-				break
 			}
 		}
 	}
 	// 这段代码加上之后能提速 但是RPC的并发量会非常爆炸
 	// 如果我还是 Leader，并且发现该节点的日志仍然落后于我的最新日志
-	//if rf.stat == Leader && rf.matchIndex[server] < rf.getLastLogIndex() {
-	//	// 立即启动下一次同步，不需要等待心跳
-	//	go rf.doHeartBeat(server)
-	//}
+	if rf.stat == Leader && rf.matchIndex[server] < rf.getLastLogIndex() {
+		// 立即启动下一次同步，不需要等待心跳
+		go rf.doHeartBeat(server)
+	}
 }
 
 // 应用log 实际上是放入上层服务的channel中
